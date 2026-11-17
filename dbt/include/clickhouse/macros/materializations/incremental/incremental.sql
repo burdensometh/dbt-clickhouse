@@ -19,6 +19,9 @@
     {% set partition_by = config.get('partition_by') %}
     {% do adapter.validate_incremental_strategy(incremental_strategy, incremental_predicates, unique_key, partition_by) %}
   {% endif %}
+  {% if config.get('backfill') %}
+    {% do clickhouse_backfill_validate_config(inserts_only, incremental_strategy | default(none), unique_key) %}
+  {% endif %}
   {%- set grant_config = config.get('grants') -%}
   {%- set has_contract = config.get('contract').enforced -%}
   {%- set full_refresh_mode = (should_full_refresh() or existing_relation.is_view) -%}

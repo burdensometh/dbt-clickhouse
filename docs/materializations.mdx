@@ -314,6 +314,44 @@ Beyond handling large transformations, microbatch provides the ability to:
 
 For detailed microbatch usage, refer to the [official documentation](https://docs.getdbt.com/docs/build/incremental-microbatch).
 
+### Backfilling corrected dimension history {#incremental-backfill}
+
+When dimension history is restated after the fact (late-arriving or corrected SCD2 versions), the raw facts do not change, so a normal incremental run never reprocesses the already-warehoused rows and their dimension version foreign keys stay stale. The `clickhouse_backfill_facts` macro adds a backfill mode to a local `incremental` fact model: in addition to the newly arrived facts, each run re-fetches the old facts covered by this round's revised business keys and effective time ranges, and rewrites their dimension foreign key against the corrected dimension.
+
+```python
+{{ config(
+    materialized = "incremental",
+    unique_key = "order_id",
+    incremental_strategy = "delete+insert"
+) }}
+
+{{ clickhouse_backfill_facts(
+    raw_facts = ref('raw_orders'),
+    dimension = ref('dim_customers'),
+    revisions = ref('dim_customer_revisions'),
+    fact_business_key = 'customer_id',
+    fact_effective_at = 'ordered_at',
+    dimension_business_key = 'customer_id',
+    dimension_id = 'customer_sk',
+    dimension_valid_from = 'valid_from',
+    dimension_valid_to = 'valid_to',
+    new_facts_filter = "o.updated_at > (select coalesce(max(updated_at), toDateTime('1970-01-01 00:00:00')) from {target})"
+) }}
+```
+
+The model selects the `raw_facts` columns (all of them by default; pass `fact_columns` to restrict or reorder them) plus the rewritten `dimension_id` column:
+
+- **New facts** are the raw facts matching `new_facts_filter` (only applied on incremental runs; `{target}` is replaced with the model's own relation). Without a filter every run reprocesses all raw facts.
+- **Re-fetched facts** are the raw facts whose business key and effective timestamp fall into one of the ranges declared by the `revisions` relation (left-closed, right-open: `valid_from <= ts < valid_to`; a null `valid_to` is open-ended). Facts already selected as new are not selected twice.
+- The dimension foreign key is resolved by matching the fact's effective timestamp against the dimension's `[valid_from, valid_to)` interval of the same business key, and is set to `NULL` when no interval covers the fact. A null dimension `valid_to` is treated as open-ended.
+
+The corrected rows are merged by the native incremental machinery keyed on `unique_key`, so only the affected facts are replaced in the target table, every other field and the fact identity are preserved, and downstream snapshots reading the fact table observe the foreign key changes. Backfill mode therefore requires a `unique_key` and a keyed strategy (`legacy` or `delete+insert`); `append`, `insert_overwrite`, `microbatch` and `inserts_only` are rejected.
+
+Before anything is published, the dimension is validated and the run aborts with a compiler error when a row has an invalid effective interval (null `valid_from`, null version id, or `valid_from >= valid_to`) or when the intervals of one business key overlap. The `revisions` relation is validated the same way (null `valid_from` or `valid_from >= valid_to` is rejected).
+
+The `revisions` relation lists this round's revised business keys and effective time ranges. By default it is expected to expose the same column names as the dimension's business key, `valid_from` and `valid_to`; override them with `revisions_business_key`, `revisions_valid_from` and `revisions_valid_to`. Reprocessing is idempotent, so keeping a round's revisions around only costs some extra scanning; truncate the relation (for example in a `post-hook`) when the corrections of a round no longer need to be replayed.
+
+
 ##### Available Microbatch Configurations {#available-microbatch-configurations}
 
 | Option             | Description                                                                                                                                                                                                                                                                                                                                | Default if any |

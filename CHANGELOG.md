@@ -1,5 +1,8 @@
 ### Unreleased
 
+#### New features
+* Local `incremental` models gain a backfill mode via the new `clickhouse_backfill_facts` macro: when dimension history is restated, the model re-fetches the old facts covered by a declared `revisions` relation (revised business keys and effective time ranges) in addition to new facts, rewrites the dimension foreign key by left-closed/right-open interval match (NULL when uncovered), validates the dimension for overlapping or invalid intervals before publishing, and merges the corrections through the native keyed incremental strategies so downstream snapshots observe the changes.
+
 #### Improvements
 * `dbt-core` is now capped at `<2.0`, and `dbt-common` and `agate` are declared as direct dependencies, matching dbt-labs adapters ([#776](https://github.com/ClickHouse/dbt-clickhouse/pull/776)).
 * `persist_docs` now warns about columns documented in the schema yml that do not exist in the relation ([#798](https://github.com/ClickHouse/dbt-clickhouse/pull/798)).

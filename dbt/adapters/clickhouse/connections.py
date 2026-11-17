@@ -16,6 +16,13 @@ if TYPE_CHECKING:
 retryable_exceptions = [ChRetryableException]
 ddl_re = re.compile(r'^\s*(CREATE|DROP|ALTER)\s', re.IGNORECASE)
 
+# Attribute stashed on the dbt Connection holding the server-side query_id of
+# the query currently executing on that connection. cancel() reads it to KILL
+# exactly that query. It is set before the query starts and cleared as soon as
+# it ends — successfully or not — so a stale binding can never match a query
+# started later on the same connection.
+_ACTIVE_QUERY_ID_ATTR = '_clickhouse_active_query_id'
+
 
 class ClickHouseConnectionManager(SQLConnectionManager):
     """
@@ -23,6 +30,22 @@ class ClickHouseConnectionManager(SQLConnectionManager):
     """
 
     TYPE = 'clickhouse'
+
+    @classmethod
+    def _set_active_query_id(cls, connection, query_id: str) -> None:
+        setattr(connection, _ACTIVE_QUERY_ID_ATTR, query_id)
+
+    @classmethod
+    def _clear_active_query_id(cls, connection, query_id: str) -> None:
+        # Only the query that set the binding may clear it.
+        if getattr(connection, _ACTIVE_QUERY_ID_ATTR, None) == query_id:
+            setattr(connection, _ACTIVE_QUERY_ID_ATTR, None)
+
+    @classmethod
+    def _pop_active_query_id(cls, connection):
+        query_id = getattr(connection, _ACTIVE_QUERY_ID_ATTR, None)
+        setattr(connection, _ACTIVE_QUERY_ID_ATTR, None)
+        return query_id
 
     @contextmanager
     def exception_handler(self, sql):
@@ -55,7 +78,25 @@ class ClickHouseConnectionManager(SQLConnectionManager):
     def cancel(self, connection):
         connection_name = connection.name
         logger.debug('Cancelling query \'{}\'', connection_name)
-        connection.handle.close()
+        # Pop the binding first: the kill below targets exactly the query that
+        # was running when cancel started. A query started later on this
+        # connection (e.g. a retry) gets a fresh binding and is never matched
+        # by this cancel.
+        query_id = self._pop_active_query_id(connection)
+        handle = connection.handle
+        if handle is not None:
+            if query_id:
+                # Closing the client does not stop server-side computation, so
+                # kill the query explicitly first. Best-effort: the handle is
+                # closed either way, and a failed kill must not abort the
+                # cancellation of the remaining connections.
+                try:
+                    handle.kill_query(query_id)
+                except Exception as ex:
+                    logger.warning(
+                        f'Failed to kill ClickHouse query {query_id} on \'{connection_name}\': {ex}'
+                    )
+            handle.close()
         logger.debug('Cancel query \'{}\'', connection_name)
 
     def release(self):
@@ -98,24 +139,28 @@ class ClickHouseConnectionManager(SQLConnectionManager):
         client = conn.handle
 
         query_id = str(uuid.uuid4())
-        with self.exception_handler(sql):
-            logger.debug(f'On {conn.name}: {sql}...')
-            pre = time.time()
-            if fetch:
-                query_result = client.query(sql, query_id=query_id)
-            else:
-                query_result = client.command(sql, query_id=query_id)
-            status = self.get_status(client)
-            logger.debug(f'SQL status: {status} in {(time.time() - pre):.2f} seconds')
-            if fetch:
-                table = self.get_table_from_response(
-                    query_result.result_set, query_result.column_names
-                )
-            else:
-                from dbt_common.clients.agate_helper import empty_table
+        self._set_active_query_id(conn, query_id)
+        try:
+            with self.exception_handler(sql):
+                logger.debug(f'On {conn.name}: {sql}...')
+                pre = time.time()
+                if fetch:
+                    query_result = client.query(sql, query_id=query_id)
+                else:
+                    query_result = client.command(sql, query_id=query_id)
+                status = self.get_status(client)
+                logger.debug(f'SQL status: {status} in {(time.time() - pre):.2f} seconds')
+                if fetch:
+                    table = self.get_table_from_response(
+                        query_result.result_set, query_result.column_names
+                    )
+                else:
+                    from dbt_common.clients.agate_helper import empty_table
 
-                table = empty_table()
-            return AdapterResponse(_message=status, query_id=query_id), table
+                    table = empty_table()
+                return AdapterResponse(_message=status, query_id=query_id), table
+        finally:
+            self._clear_active_query_id(conn, query_id)
 
     def add_query(
         self,
@@ -127,13 +172,18 @@ class ClickHouseConnectionManager(SQLConnectionManager):
         sql = self._add_query_comment(sql)
         conn = self.get_thread_connection()
         client = conn.handle
-        with self.exception_handler(sql):
-            logger.debug(f'On {conn.name}: {sql}...')
-            pre = time.time()
-            client.command(sql)
-            status = self.get_status(client)
-            logger.debug(f'SQL status: {status} in {(time.time() - pre):0.2f} seconds')
-            return conn, None
+        query_id = str(uuid.uuid4())
+        self._set_active_query_id(conn, query_id)
+        try:
+            with self.exception_handler(sql):
+                logger.debug(f'On {conn.name}: {sql}...')
+                pre = time.time()
+                client.command(sql, query_id=query_id)
+                status = self.get_status(client)
+                logger.debug(f'SQL status: {status} in {(time.time() - pre):0.2f} seconds')
+                return conn, None
+        finally:
+            self._clear_active_query_id(conn, query_id)
 
     @classmethod
     def get_credentials(cls, credentials):

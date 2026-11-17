@@ -1,8 +1,15 @@
+import threading
 import uuid
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from dbt.adapters.clickhouse.connections import ClickHouseConnectionManager
+import pytest
+from dbt.adapters.clickhouse.connections import (
+    _ACTIVE_QUERY_ID_ATTR,
+    ClickHouseConnectionManager,
+)
 from dbt.adapters.sql import SQLConnectionManager
+from dbt_common.exceptions import DbtRuntimeError
 
 
 def _make_manager_with_client(mock_client):
@@ -14,6 +21,18 @@ def _make_manager_with_client(mock_client):
     manager.get_thread_connection = MagicMock(return_value=conn)
     manager._add_query_comment = lambda s: s
     return manager
+
+
+def _make_manager_and_conn(mock_client):
+    # A SimpleNamespace, not a MagicMock: the binding check relies on
+    # getattr(conn, _ACTIVE_QUERY_ID_ATTR, None) returning None when unset,
+    # which a MagicMock would auto-create instead.
+    conn = SimpleNamespace(name='test', handle=mock_client)
+
+    manager = ClickHouseConnectionManager.__new__(ClickHouseConnectionManager)
+    manager.get_thread_connection = MagicMock(return_value=conn)
+    manager._add_query_comment = lambda s: s
+    return manager, conn
 
 
 class TestAdapterResponseQueryId:
@@ -109,3 +128,157 @@ class TestReleaseRespectsReuseConnections:
         with patch.object(SQLConnectionManager, 'release') as mock_super_release:
             manager.release()
         mock_super_release.assert_called_once()
+
+
+class TestActiveQueryBinding:
+    def test_execute_binds_query_id_for_the_duration_of_the_query(self):
+        mock_client = MagicMock()
+        manager, conn = _make_manager_and_conn(mock_client)
+        seen = []
+
+        def capture_binding(*args, **kwargs):
+            seen.append(getattr(conn, _ACTIVE_QUERY_ID_ATTR, None))
+
+        mock_client.command.side_effect = capture_binding
+
+        response, _ = manager.execute('INSERT INTO t SELECT 1')
+
+        assert seen == [response.query_id]
+        assert getattr(conn, _ACTIVE_QUERY_ID_ATTR, None) is None
+
+    def test_execute_clears_binding_when_query_raises(self):
+        mock_client = MagicMock()
+        mock_client.command.side_effect = RuntimeError('boom')
+        manager, conn = _make_manager_and_conn(mock_client)
+
+        with pytest.raises(DbtRuntimeError):
+            manager.execute('INSERT INTO t SELECT 1')
+
+        assert getattr(conn, _ACTIVE_QUERY_ID_ATTR, None) is None
+
+    def test_add_query_binds_and_clears_query_id(self):
+        mock_client = MagicMock()
+        manager, conn = _make_manager_and_conn(mock_client)
+        seen = []
+
+        def capture_binding(*args, **kwargs):
+            seen.append(getattr(conn, _ACTIVE_QUERY_ID_ATTR, None))
+
+        mock_client.command.side_effect = capture_binding
+
+        manager.add_query('INSERT INTO t SELECT 1')
+
+        _, kwargs = mock_client.command.call_args
+        assert kwargs['query_id'] is not None
+        assert seen == [kwargs['query_id']]
+        assert getattr(conn, _ACTIVE_QUERY_ID_ATTR, None) is None
+
+    def test_add_query_clears_binding_when_query_raises(self):
+        mock_client = MagicMock()
+        mock_client.command.side_effect = RuntimeError('boom')
+        manager, conn = _make_manager_and_conn(mock_client)
+
+        with pytest.raises(DbtRuntimeError):
+            manager.add_query('INSERT INTO t SELECT 1')
+
+        assert getattr(conn, _ACTIVE_QUERY_ID_ATTR, None) is None
+
+
+class TestCancel:
+    def test_cancel_kills_the_bound_query_then_closes(self):
+        mock_client = MagicMock()
+        manager, conn = _make_manager_and_conn(mock_client)
+        setattr(conn, _ACTIVE_QUERY_ID_ATTR, 'qid-123')
+
+        manager.cancel(conn)
+
+        mock_client.kill_query.assert_called_once_with('qid-123')
+        mock_client.close.assert_called_once()
+        assert getattr(conn, _ACTIVE_QUERY_ID_ATTR, None) is None
+
+    def test_cancel_without_active_query_only_closes(self):
+        mock_client = MagicMock()
+        manager, conn = _make_manager_and_conn(mock_client)
+
+        manager.cancel(conn)
+
+        mock_client.kill_query.assert_not_called()
+        mock_client.close.assert_called_once()
+
+    def test_second_cancel_without_new_query_does_not_kill_again(self):
+        # The binding is consumed by the first cancel, so a query started
+        # later on the same connection can never be matched by a stale cancel.
+        mock_client = MagicMock()
+        manager, conn = _make_manager_and_conn(mock_client)
+        setattr(conn, _ACTIVE_QUERY_ID_ATTR, 'qid-123')
+
+        manager.cancel(conn)
+        manager.cancel(conn)
+
+        mock_client.kill_query.assert_called_once_with('qid-123')
+
+    def test_cancel_only_kills_the_query_bound_to_that_connection(self):
+        mock_client_a = MagicMock()
+        mock_client_b = MagicMock()
+        manager = ClickHouseConnectionManager.__new__(ClickHouseConnectionManager)
+        conn_a = SimpleNamespace(name='model_a', handle=mock_client_a)
+        conn_b = SimpleNamespace(name='model_b', handle=mock_client_b)
+        setattr(conn_a, _ACTIVE_QUERY_ID_ATTR, 'qid-a')
+        setattr(conn_b, _ACTIVE_QUERY_ID_ATTR, 'qid-b')
+
+        manager.cancel(conn_a)
+
+        mock_client_a.kill_query.assert_called_once_with('qid-a')
+        mock_client_b.kill_query.assert_not_called()
+        mock_client_b.close.assert_not_called()
+        assert getattr(conn_b, _ACTIVE_QUERY_ID_ATTR, None) == 'qid-b'
+
+    def test_cancel_closes_handle_even_when_kill_fails(self):
+        mock_client = MagicMock()
+        mock_client.kill_query.side_effect = RuntimeError('network down')
+        manager, conn = _make_manager_and_conn(mock_client)
+        setattr(conn, _ACTIVE_QUERY_ID_ATTR, 'qid-123')
+
+        manager.cancel(conn)  # must not raise
+
+        mock_client.close.assert_called_once()
+
+    def test_cancel_without_handle_does_not_raise(self):
+        manager, conn = _make_manager_and_conn(None)
+
+        manager.cancel(conn)
+
+    def test_cancel_from_another_thread_kills_the_in_flight_query(self):
+        # Mirrors dbt's shutdown path: the model thread is blocked in
+        # execute() while the main thread cancels its connection.
+        mock_client = MagicMock()
+        manager, conn = _make_manager_and_conn(mock_client)
+        started = threading.Event()
+        finish = threading.Event()
+
+        def blocking_command(*args, **kwargs):
+            started.set()
+            finish.wait(10)
+            raise RuntimeError('query was cancelled')
+
+        mock_client.command.side_effect = blocking_command
+
+        def run():
+            try:
+                manager.execute('INSERT INTO t SELECT 1')
+            except DbtRuntimeError:
+                pass
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            assert started.wait(5)
+            manager.cancel(conn)
+        finally:
+            finish.set()
+        thread.join(5)
+
+        assert not thread.is_alive()
+        _, kwargs = mock_client.command.call_args
+        mock_client.kill_query.assert_called_once_with(kwargs['query_id'])
+        assert getattr(conn, _ACTIVE_QUERY_ID_ATTR, None) is None

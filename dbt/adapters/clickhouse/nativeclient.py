@@ -6,7 +6,7 @@ from clickhouse_driver.errors import NetworkError, SocketTimeoutError
 from dbt.adapters.__about__ import version as dbt_adapters_version
 from dbt.adapters.clickhouse import ClickHouseColumn, ClickHouseCredentials
 from dbt.adapters.clickhouse.__version__ import version as dbt_clickhouse_version
-from dbt.adapters.clickhouse.dbclient import ChClientWrapper, ChRetryableException
+from dbt.adapters.clickhouse.dbclient import ChClientWrapper, ChRetryableException, kill_query_sql
 from dbt.adapters.clickhouse.util import hide_stack_trace
 from dbt_common.exceptions import DbtDatabaseError
 
@@ -57,6 +57,16 @@ class ChNativeClient(ChClientWrapper):
 
     def close(self):
         self._client.disconnect()
+
+    def kill_query(self, query_id: str):
+        # A clickhouse-driver connection is a single socket that cannot carry
+        # a second query while one is in flight, so the kill goes over a
+        # fresh, short-lived connection.
+        kill_client = self._create_client(self._credentials)
+        try:
+            kill_client.execute(kill_query_sql(query_id))
+        finally:
+            kill_client.disconnect()
 
     def _create_client(self, credentials: ClickHouseCredentials):
         client = clickhouse_driver.Client(

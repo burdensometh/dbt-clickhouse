@@ -84,9 +84,20 @@ class ChRetryableException(Exception):
     pass
 
 
+def kill_query_sql(query_id: str) -> str:
+    """
+    Build the KILL QUERY statement for exactly one server-side query_id.
+    Killing by query_id is precise: a query that already finished is
+    unaffected (its results stay), and no other connection's query can match.
+    """
+    escaped = query_id.replace('\\', '\\\\').replace("'", "\\'")
+    return f"KILL QUERY WHERE query_id = '{escaped}'"
+
+
 class ChClientWrapper(ABC):
     def __init__(self, credentials: ClickHouseCredentials):
         self.database = credentials.schema
+        self._credentials = credentials
         custom_settings = credentials.custom_settings or {}
         self._conn_settings = custom_settings.copy()
         if credentials.cluster_mode or credentials.database_engine == 'Replicated':
@@ -127,6 +138,18 @@ class ChClientWrapper(ABC):
 
     @abstractmethod
     def query(self, sql: str, **kwargs):
+        pass
+
+    @abstractmethod
+    def kill_query(self, query_id: str):
+        """
+        Terminate the server-side query with exactly this query_id.
+
+        Must go over a fresh, short-lived connection: the connection running
+        the query is busy (and, over HTTP, locked to its session), so it
+        cannot carry the kill itself. Best-effort — the caller decides how to
+        handle a kill that never reached the server.
+        """
         pass
 
     @abstractmethod

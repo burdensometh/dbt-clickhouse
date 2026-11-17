@@ -7,8 +7,13 @@ import pytest
 from clickhouse_connect.driver.exceptions import OperationalError
 from clickhouse_connect.driver.httputil import all_managers
 from dbt.adapters.clickhouse.credentials import ClickHouseCredentials
-from dbt.adapters.clickhouse.dbclient import ND_MUTATION_SETTING, ChRetryableException
+from dbt.adapters.clickhouse.dbclient import (
+    ND_MUTATION_SETTING,
+    ChRetryableException,
+    kill_query_sql,
+)
 from dbt.adapters.clickhouse.httpclient import ChHttpClient
+from dbt.adapters.clickhouse.nativeclient import ChNativeClient
 from dbt_common.exceptions import DbtConfigError, DbtDatabaseError
 from urllib3.poolmanager import ProxyManager
 
@@ -434,3 +439,115 @@ def test_dedicated_pool_honors_env_proxy(mock_ch_client):
     assert isinstance(client._dedicated_pool, ProxyManager)
     assert str(client._dedicated_pool.proxy.url) == 'http://proxy.example:3128'
     client.close()
+
+
+class TestKillQuerySql:
+    def test_kill_query_sql_targets_exact_query_id(self):
+        assert kill_query_sql('abc-123') == "KILL QUERY WHERE query_id = 'abc-123'"
+
+    def test_kill_query_sql_escapes_quotes_and_backslashes(self):
+        assert kill_query_sql("a'b\\c") == "KILL QUERY WHERE query_id = 'a\\'b\\\\c'"
+
+
+class TestHttpKillQuery:
+    def test_kill_query_uses_fresh_sessionless_client(self, mock_ch_client):
+        """The kill must not reuse the model's client: clickhouse-connect rejects
+        concurrent requests on one client, and the server locks the session while
+        a query runs on it."""
+        credentials = ClickHouseCredentials(
+            host='localhost',
+            port=8123,
+            user='default',
+            password='',
+            schema='default',
+        )
+        client = ChHttpClient(credentials)
+        mock_ch_client.reset_mock()
+
+        client.kill_query('qid-1')
+
+        mock_ch_client.assert_called_once()
+        kwargs = mock_ch_client.call_args.kwargs
+        assert 'session_id' not in kwargs
+        assert 'settings' not in kwargs
+        assert 'pool_mgr' not in kwargs
+        kill_client = mock_ch_client.return_value
+        kill_client.command.assert_called_once_with("KILL QUERY WHERE query_id = 'qid-1'")
+        kill_client.close.assert_called_once()
+
+    def test_kill_query_closes_kill_client_when_command_fails(self, mock_ch_client):
+        credentials = ClickHouseCredentials(
+            host='localhost',
+            port=8123,
+            user='default',
+            password='',
+            schema='default',
+        )
+        client = ChHttpClient(credentials)
+        mock_ch_client.reset_mock()
+        mock_ch_client.return_value.command.side_effect = DbtDatabaseError('down')
+
+        with pytest.raises(DbtDatabaseError):
+            client.kill_query('qid-1')
+
+        mock_ch_client.return_value.close.assert_called_once()
+
+    def test_kill_query_does_not_touch_dedicated_pool(self, mock_ch_client):
+        """With reuse_connections False the kill client must not allocate or
+        replace the wrapper's dedicated pool."""
+        credentials = ClickHouseCredentials(
+            host='localhost',
+            port=8123,
+            user='default',
+            password='',
+            schema='default',
+            reuse_connections=False,
+        )
+        client = ChHttpClient(credentials)
+        pool = client._dedicated_pool
+        mock_ch_client.reset_mock()
+
+        client.kill_query('qid-1')
+
+        assert client._dedicated_pool is pool
+        assert 'pool_mgr' not in mock_ch_client.call_args.kwargs
+        client.close()
+
+
+class TestNativeKillQuery:
+    def _make_native_client(self, mock_driver):
+        mock_driver.return_value.execute.return_value = [('1', 0)]
+        credentials = ClickHouseCredentials(
+            host='localhost',
+            port=9000,
+            user='default',
+            password='',
+            schema='default',
+            driver='native',
+            check_exchange=False,
+        )
+        return ChNativeClient(credentials)
+
+    def test_kill_query_uses_fresh_connection(self):
+        with patch('clickhouse_driver.Client') as mock_driver:
+            client = self._make_native_client(mock_driver)
+            mock_driver.reset_mock()
+
+            client.kill_query('qid-2')
+
+            # a brand new, short-lived connection carries the kill
+            mock_driver.assert_called_once()
+            kill_client = mock_driver.return_value
+            kill_client.execute.assert_called_once_with("KILL QUERY WHERE query_id = 'qid-2'")
+            kill_client.disconnect.assert_called_once()
+
+    def test_kill_query_disconnects_when_execute_fails(self):
+        with patch('clickhouse_driver.Client') as mock_driver:
+            client = self._make_native_client(mock_driver)
+            mock_driver.reset_mock()
+            mock_driver.return_value.execute.side_effect = RuntimeError('down')
+
+            with pytest.raises(RuntimeError):
+                client.kill_query('qid-2')
+
+            mock_driver.return_value.disconnect.assert_called_once()

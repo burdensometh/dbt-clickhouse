@@ -7,7 +7,7 @@ from clickhouse_connect.driver.httputil import all_managers, check_env_proxy, ge
 from dbt.adapters.__about__ import version as dbt_adapters_version
 from dbt.adapters.clickhouse import ClickHouseColumn
 from dbt.adapters.clickhouse.__version__ import version as dbt_clickhouse_version
-from dbt.adapters.clickhouse.dbclient import ChClientWrapper, ChRetryableException
+from dbt.adapters.clickhouse.dbclient import ChClientWrapper, ChRetryableException, kill_query_sql
 from dbt.adapters.clickhouse.util import hide_stack_trace
 from dbt_common.exceptions import DbtDatabaseError
 
@@ -56,6 +56,34 @@ class ChHttpClient(ChClientWrapper):
     def get_ch_setting(self, setting_name):
         setting = self._client.server_settings.get(setting_name)
         return (setting.value, setting.readonly) if setting else (None, 0)
+
+    def kill_query(self, query_id: str):
+        # The model's own client cannot carry the kill: clickhouse-connect
+        # rejects concurrent requests on one client, and ClickHouse locks the
+        # session while a query runs on it. A fresh client without a
+        # session_id has neither problem. It intentionally skips the
+        # reuse_connections pool handling — the shared pool is fine for a
+        # one-off request, and a dedicated pool would just need discarding.
+        credentials = self._credentials
+        kill_client = clickhouse_connect.get_client(
+            host=credentials.host,
+            port=credentials.port,
+            username=credentials.user,
+            password=credentials.password,
+            interface='https' if credentials.secure else 'http',
+            connect_timeout=credentials.connect_timeout,
+            send_receive_timeout=credentials.send_receive_timeout,
+            client_name=f'dbt-adapters/{dbt_adapters_version} dbt-clickhouse/{dbt_clickhouse_version}',
+            verify=credentials.verify,
+            server_host_name=credentials.server_host_name,
+            client_cert=credentials.client_cert,
+            client_cert_key=credentials.client_cert_key,
+            query_limit=0,
+        )
+        try:
+            kill_client.command(kill_query_sql(query_id))
+        finally:
+            kill_client.close()
 
     def database_dropped(self, database: str):
         super().database_dropped(database)

@@ -1,5 +1,8 @@
 ### Unreleased
 
+#### New Features
+* Add a ClickHouse-specific `valid_time` snapshot strategy that builds type-2 history from a business effective timestamp (`updated_at`) instead of observation time, so late-arriving corrections can be backfilled at any point. It collapses consecutive same-valued observations into left-closed/right-open intervals, reuses the existing `dbt_scd_id` for unchanged interval starts, errors on contradictory rows for the same key and effective timestamp, and leaves the stored history untouched on failure ([#803](https://github.com/ClickHouse/dbt-clickhouse/pull/803)).
+
 #### Improvements
 * `dbt-core` is now capped at `<2.0`, and `dbt-common` and `agate` are declared as direct dependencies, matching dbt-labs adapters ([#776](https://github.com/ClickHouse/dbt-clickhouse/pull/776)).
 * `persist_docs` now warns about columns documented in the schema yml that do not exist in the relation ([#798](https://github.com/ClickHouse/dbt-clickhouse/pull/798)).

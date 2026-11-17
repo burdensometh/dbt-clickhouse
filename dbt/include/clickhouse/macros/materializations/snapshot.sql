@@ -14,6 +14,10 @@
 
     {{ drop_relation_if_exists(tmp_relation) }}
 
+    {% if config.get('strategy') == 'valid_time' %}
+        {{ clickhouse__valid_time_assert_no_contradictions(strategy, sql) }}
+    {% endif %}
+
     {% set select = snapshot_staging_table(strategy, sql, target_relation) %}
 
     {% call statement('build_snapshot_staging_relation') %}
@@ -24,6 +28,9 @@
 {% endmacro %}
 
 {% macro clickhouse__snapshot_merge_sql(target, source, insert_cols) -%}
+  {%- if config.get('strategy') == 'valid_time' -%}
+    {{ return(clickhouse__valid_time_snapshot_merge_sql(target, source, insert_cols)) }}
+  {%- endif -%}
   {%- set insert_cols_csv = insert_cols | join(', ') -%}
   {%- set valid_to_col = adapter.quote('dbt_valid_to') -%}
 
@@ -92,12 +99,23 @@
 
 {% macro clickhouse__snapshot_staging_table(strategy, source_sql, target_relation) -%}
     {# Detect strategy type and delegate to specific macro #}
-    {% if strategy.updated_at == 'now()' or 'now()' in strategy.updated_at %}
+    {% if config.get('strategy') == 'valid_time' %}
+        {{ clickhouse__snapshot_staging_table_valid_time(strategy, source_sql, target_relation) }}
+    {% elif strategy.updated_at == 'now()' or 'now()' in strategy.updated_at %}
         {{ clickhouse__snapshot_staging_table_check_strategy(strategy, source_sql, target_relation) }}
     {% else %}
         {{ clickhouse__snapshot_staging_table_timestamp_strategy(strategy, source_sql, target_relation) }}
     {% endif %}
 {%- endmacro %}
+
+{% macro clickhouse__build_snapshot_table(strategy, sql) %}
+    {% if config.get('strategy') == 'valid_time' %}
+        {{ clickhouse__valid_time_assert_no_contradictions(strategy, sql) }}
+        {{ return(clickhouse__build_snapshot_table_valid_time(strategy, sql)) }}
+    {% else %}
+        {{ return(default__build_snapshot_table(strategy, sql)) }}
+    {% endif %}
+{% endmacro %}
 
 {% macro clickhouse__snapshot_staging_table_check_strategy(strategy, source_sql, target_relation) -%}
 

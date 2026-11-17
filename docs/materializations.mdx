@@ -562,6 +562,29 @@ select * from {{ ref('<model-name>') }}
 
 For a worked example on the Jaffle Shop, see the [snapshot section of the guides](/integrations/connectors/data-ingestion/etl-tools/dbt/guides#snapshot). For all options, check out the [snapshot configs](https://docs.getdbt.com/docs/build/snapshots#snapshot-configs) reference page.
 
+### The `valid_time` strategy {#snapshot-valid-time}
+
+The standard `timestamp` and `check` strategies record when a change was *observed* by dbt. When your source carries its own business effective timestamp and late-arriving data can correct any point in the past, use the ClickHouse-specific `valid_time` strategy instead. It builds type-2 history keyed by business effective time rather than observation time, so backfilled corrections land at the right point on the timeline.
+
+```yaml
+snapshots:
+  - name: <snapshot-name>
+    relation: ref('<model-name>')
+    config:
+      unique_key: <column-name>          # a column or a list of columns
+      strategy: valid_time
+      updated_at: <effective-timestamp-column>
+```
+
+The model query must return the **complete observation set known as of this run** for every business key it contains: one row per business key and effective timestamp, carrying the full attribute set. On each run the strategy:
+
+- rejects the batch with an error if the same business key and effective timestamp arrives with contradictory attributes (identical duplicate rows are allowed and collapse);
+- collapses consecutive observations that carry the same attributes into left-closed, right-open `[dbt_valid_from, dbt_valid_to)` intervals, so repeated same-valued rows do not fragment the history;
+- closes, inserts, or replaces the affected history rows while leaving keys absent from the batch untouched;
+- keeps the existing `dbt_scd_id` of any interval whose starting effective timestamp already exists, and mints a deterministic id for new effective points.
+
+The new table version is built in a staging table and swapped in atomically, so a failed run — including a batch contradiction — leaves the previously stored history unchanged.
+
 ## Contracts and Constraints {#contracts-and-constraints}
 
 Only exact column type contracts are supported. For example, a contract with a UInt32 column type will fail if the model
